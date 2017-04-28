@@ -18,8 +18,8 @@ package io.netty.util.internal;
 import io.netty.util.internal.logging.InternalLogger;
 import io.netty.util.internal.logging.InternalLoggerFactory;
 
-import java.io.Closeable;
 import java.io.ByteArrayOutputStream;
+import java.io.Closeable;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
@@ -224,6 +224,18 @@ public final class NativeLibraryLoader {
             out = null;
 
             loadLibrary(loader, tmpFile.getPath(), true);
+        } catch (UnsatisfiedLinkError e) {
+            try {
+                if (tmpFile.isFile() && tmpFile.canRead() && NoexecFileStoreDetector.isOnNoexecFileStore(tmpFile)) {
+                    logger.info("{} exists and is readable but cannot be loaded because device mounted with noexec; " +
+                                "use -Dio.netty.native.workdir=[path] to set native working directory separately.",
+                                tmpFile.getPath());
+                }
+            } catch (Throwable t) {
+                // Ignore
+            }
+            // Re-throw to fail the load
+            throw e;
         } catch (Exception e) {
             throw (UnsatisfiedLinkError) new UnsatisfiedLinkError(
                     "could not load a native library: " + name).initCause(e);
@@ -367,5 +379,57 @@ public final class NativeLibraryLoader {
 
     private NativeLibraryLoader() {
         // Utility
+    }
+
+    private static final class NoexecFileStoreDetector {
+        static final Method TO_PATH_METHOD;
+        static final Method GET_FILE_STORE_METHOD;
+        static final Method MOUNT_ENTRY_METHOD;
+        static final Method HAS_OPTION_METHOD;
+
+        static {
+            Method toPathMethod = null;
+            Method getFileStoreMethod = null;
+            Method mountEntryMethod = null;
+            Method hasOptionMethod = null;
+            try {
+                // Use reflection for so Java 6 fails gracefully.
+                toPathMethod = File.class.getMethod("toPath");
+                Class<?> pathClass = Class.forName("java.nio.file.Path");
+                getFileStoreMethod = Class.forName("java.nio.file.Files").getMethod("getFileStore", pathClass);
+                Class<?> unixFileStoreClass = Class.forName("sun.nio.fs.UnixFileStore");
+                mountEntryMethod = unixFileStoreClass.getDeclaredMethod("entry");
+                mountEntryMethod.setAccessible(true);
+                Class<?> unixMountEntryClass = Class.forName("sun.nio.fs.UnixMountEntry");
+                hasOptionMethod = unixMountEntryClass.getDeclaredMethod("hasOption", String.class);
+                hasOptionMethod.setAccessible(true);
+            } catch (ClassNotFoundException e) {
+                // Normal on non-Unix operating systems or on Java < 7
+            } catch (Throwable t) {
+                // Java 9 will produce java.lang.reflect.InaccessibleObjectException
+                // without --add-opens java.base/sun.nio.fs=...; the exception message is clear.
+                logger.debug("Failed to initialize NoexecFileStoreDetector", t);
+            }
+            TO_PATH_METHOD = toPathMethod;
+            GET_FILE_STORE_METHOD = getFileStoreMethod;
+            MOUNT_ENTRY_METHOD = mountEntryMethod;
+            HAS_OPTION_METHOD = hasOptionMethod;
+        }
+
+        static boolean isOnNoexecFileStore(File file) {
+            if (HAS_OPTION_METHOD == null || MOUNT_ENTRY_METHOD == null ||
+                GET_FILE_STORE_METHOD == null || TO_PATH_METHOD == null) {
+                return false;
+            }
+            try {
+                Object path = TO_PATH_METHOD.invoke(file);
+                Object fileStore = GET_FILE_STORE_METHOD.invoke(null, path);
+                Object mountEntry = MOUNT_ENTRY_METHOD.invoke(fileStore);
+                return (Boolean) HAS_OPTION_METHOD.invoke(mountEntry, "noexec");
+            } catch (Throwable t) {
+                logger.debug("Error checking if {} is on a file store mounted with noexec", file, t);
+            }
+            return false;
+        }
     }
 }
